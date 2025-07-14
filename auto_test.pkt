@@ -1,0 +1,18 @@
+# Automated pktgen test commands
+echo "=== Configuring Port 0 ==="
+set 0 dst 40:a6:b7:c3:3e:d0
+set 0 proto udp
+set 0 dstport 8000
+set 0 srcip 10.10.1.1/32
+set 0 dstip 10.10.1.2/32
+set 0 size 64
+set 0 rate 10
+set 0 count 0
+
+echo "=== Starting Traffic ==="
+start 0
+sleep 30
+echo "=== Stopping Traffic ==="
+stop 0
+sleep 2
+quit

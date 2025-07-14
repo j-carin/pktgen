@@ -1,0 +1,252 @@
+Project Path: pktgen
+
+Source Tree:
+
+```txt
+pktgen
+├── auto_pktgen.sh
+├── auto_test.lua
+├── auto_test.pkt
+├── preflight.sh
+└── run_pktgen.sh
+
+```
+
+`pktgen/auto_pktgen.sh`:
+
+```sh
+#!/usr/bin/env bash
+#
+# Minimal Pktgen launcher.
+# Assumes:
+#   • The NIC (0000:17:00.0) is already bound to vfio-pci
+#   • Huge pages are mounted
+#   • $HOME/Pktgen-DPDK/Builddir/app/pktgen exists and is executable
+#   • $HOME/dpdk variables are already exported if you need them
+#   • Link is UP before you run this script
+#
+set -euo pipefail
+
+PKTGEN_BIN="$HOME/Pktgen-DPDK/Builddir/app/pktgen"
+LUA_SCRIPT="$PWD/auto_test.lua"          # this dir holds the Lua file
+LOG="pktgen_$(date +%Y%m%d_%H%M%S).log"  # timestamped console log
+
+echo "Launching Pktgen; console will be saved to: $LOG"
+RATE="${RATE:-10}"
+
+sudo script -qec \
+  "$PKTGEN_BIN -l 6-8 -n 4 -- \
+     -m '[7:8].0' -f '$LUA_SCRIPT' -P" \
+  "$LOG"
+
+echo "Run complete. Result line:"
+grep '^RESULT:' "$LOG" || echo "(no RESULT line found — check $LOG)"
+
+
+```
+
+`pktgen/auto_test.lua`:
+
+```lua
+-- ------------------------------------------------------------------
+-- Tell Lua where Intel's helper module lives
+local PKTGEN_HOME   = os.getenv("PKTGEN_HOME")         -- user may export it
+                    or (os.getenv("HOME") .. "/Pktgen-DPDK")
+
+package.path = package.path ..
+               ";" .. PKTGEN_HOME .. "/app/?.lua"      -- Pktgen.lua
+
+require "Pktgen"                        -- <-- now resolvable
+-- ------------------------------------------------------------------
+
+local P = "0"                     -- port id
+local RATE      = tonumber(os.getenv("RATE") or "10")
+local PKT_SIZE  = 64
+local DST_MAC   = "40:a6:b7:c3:3e:d0"
+local SRC_IP    = "10.10.1.1/32"
+local DST_IP    = "10.10.1.2"
+local DST_PORT  = 8000
+
+-- wait until the PHY is up (optional but handy)
+while pktgen.linkState(P) == 0 do
+    printf("Waiting for link on port %s...\n", P)
+    pktgen.delay(1000)
+end
+
+pktgen.stop(P)                              -- make sure port is idle
+pktgen.set_mac (P, "dst", DST_MAC)
+pktgen.set_ipaddr(P, "src", SRC_IP)
+pktgen.set_ipaddr(P, "dst", DST_IP)
+pktgen.set_proto(P, "udp")
+pktgen.set     (P, "dport", DST_PORT)
+pktgen.set     (P, "size",  PKT_SIZE)
+pktgen.set     (P, "rate",  RATE)
+pktgen.set     (P, "count", 0)              -- forever
+
+printf("=== Traffic %s %% ===\n", RATE)
+pktgen.start(P)
+pktgen.delay(30000)
+pktgen.stop(P)
+
+-- ----- one-line summary -------------------------------------------
+local tot  = pktgen.portStats(P, "port")[tonumber(P)]   -- totals
+local rate = pktgen.portStats(P, "rate")[tonumber(P)]   -- per-sec rates
+
+-- convert bits-per-second to megabits-per-second
+local tx_mbps = (rate.tx_bps or 0) / 1e6
+local rx_mbps = (rate.rx_bps or 0) / 1e6
+
+printf("RESULT: TxPkts=%d  RxPkts=%d  TxMbps=%.2f  RxMbps=%.2f\n",
+       tot.opackets or 0, tot.ipackets or 0, tx_mbps, rx_mbps)
+-- ---------------------------------------------------------------
+
+pktgen.quit()
+
+```
+
+`pktgen/auto_test.pkt`:
+
+```pkt
+# Automated pktgen test commands
+echo "=== Configuring Port 0 ==="
+set 0 dst 40:a6:b7:c3:3e:d0
+set 0 proto udp
+set 0 dstport 8000
+set 0 srcip 10.10.1.1/32
+set 0 dstip 10.10.1.2/32
+set 0 size 64
+set 0 rate 10
+set 0 count 0
+
+echo "=== Starting Traffic ==="
+start 0
+sleep 30
+echo "=== Stopping Traffic ==="
+stop 0
+sleep 2
+quit
+```
+
+`pktgen/preflight.sh`:
+
+```sh
+#!/usr/bin/env bash
+#
+# Pktgen pre-flight checker (rev-2)
+# Verifies readiness without changing system state.
+#
+set -euo pipefail
+
+PCI_ID="0000:17:00.0"
+IFACE="enp23s0f0np0"
+PKTGEN_BIN="$HOME/Pktgen-DPDK/Builddir/app/pktgen"
+LUA_SCRIPT="$PWD/auto_test.lua"
+
+pass() { echo "✅ $*"; }
+fail() { echo "❌ $*"; exit 1; }
+
+echo "=== Pktgen pre-flight checks ==="
+
+[[ -x "$PKTGEN_BIN" ]]   && pass "pktgen binary found" \
+                        || fail "Missing or non-executable $PKTGEN_BIN"
+
+[[ -f "$LUA_SCRIPT" ]]   && pass "Lua script found ($LUA_SCRIPT)" \
+                        || fail "Lua script not found"
+
+mount | grep -q '/dev/hugepages' \
+                        && pass "hugepages mounted" \
+                        || fail "/dev/hugepages not mounted"
+
+DRV_LINE=$(sudo ~/dpdk/usertools/dpdk-devbind.py --status | grep "$PCI_ID") || true
+[[ $DRV_LINE == *"drv=vfio-pci"* ]] && BOUND="vfio" || BOUND="kernel"
+
+if [[ $BOUND == "kernel" ]]; then
+    pass "NIC bound to kernel driver (ice)"
+    # Only kernel mode exposes the netdev; run ethtool.
+    if [[ -e /sys/class/net/$IFACE ]]; then
+        read -r SPEED LINK <<<$(ethtool "$IFACE" |
+                                awk '/Speed:|Link detected:/ {print $2}')
+        [[ $SPEED == "100000Mb/s" && $LINK == "yes" ]] \
+            && pass "Link is UP at 100 G" \
+            || fail "Link bad (Speed=$SPEED, Link=$LINK)"
+    else
+        fail "Netdev $IFACE not present"
+    fi
+else
+    pass "NIC bound to vfio-pci (DPDK) — link check skipped"
+fi
+
+echo "=== All checks passed — READY ==="
+
+
+```
+
+`pktgen/run_pktgen.sh`:
+
+```sh
+#!/bin/bash
+
+# DPDK Pktgen Test Script
+# Run this script to test packet generation with your E810 NIC
+
+set -e
+
+echo "=== DPDK Pktgen Test Script ==="
+echo
+
+# Setup environment
+echo "Setting up environment..."
+export RTE_SDK=$HOME/dpdk
+export RTE_TARGET=build
+
+# Load kernel module
+echo "Loading vfio-pci module..."
+sudo modprobe vfio-pci
+
+# Check if interface is up and bring it down
+if ip link show enp23s0f0np0 >/dev/null 2>&1; then
+    echo "Bringing down interface enp23s0f0np0..."
+    sudo ip link set enp23s0f0np0 down
+fi
+
+# Bind NIC to DPDK
+echo "Binding E810 NIC to DPDK..."
+sudo ~/dpdk/usertools/dpdk-devbind.py --bind=vfio-pci 17:00.0
+
+echo "Checking device binding..."
+~/dpdk/usertools/dpdk-devbind.py --status | grep 17:00.0
+
+echo
+echo "=== Starting Pktgen Interactive Mode ==="
+echo "Commands you can use in pktgen:"
+echo "  set 0 dst 40:a6:b7:c3:3e:d0     # Set destination MAC"
+echo "  set 0 proto udp                 # Set protocol to UDP"
+echo "  set 0 dstport 8000              # Set destination port"
+echo "  set 0 srcip 10.10.1.1/32        # Set source IP"
+echo "  set 0 dstip 10.10.1.2/32        # Set destination IP"
+echo "  set 0 size 64                   # Set packet size"
+echo "  set 0 rate 10                   # Set rate to 10%"
+echo "  start 0                         # Start traffic"
+echo "  stop 0                          # Stop traffic"
+echo "  quit                            # Exit pktgen"
+echo
+echo "Press any key to start pktgen..."
+read -n 1 -s
+
+# Run pktgen interactively
+sudo ~/Pktgen-DPDK/usr/local/bin/pktgen -l 5-7 -n 4 -- -m "[6:7].0" -P
+
+# Cleanup function
+cleanup() {
+    echo
+    echo "=== Cleaning up ==="
+    echo "Returning NIC to kernel driver..."
+    sudo ~/dpdk/usertools/dpdk-devbind.py --bind=ice 17:00.0
+    echo "Cleanup complete!"
+}
+
+# Set trap to cleanup on exit
+trap cleanup EXIT
+
+echo "Script completed!"
+```
